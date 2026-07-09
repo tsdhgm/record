@@ -1,0 +1,344 @@
+おっしゃる用途だと、**「画面を録画する」だけでは足りず、あとで検索・引用・読み返しできる“会話DB”が必要**です。
+特に Claude/Codex/Gemini/Cursor Composer 系は、TUI が画面を書き換えるので、`screen` や単純なログでは「表示されたはずの質問・選択肢」が消えます。
+
+私なら、汎用構成はこうします。
+
+## 結論：一番よさそうな構成
+
+**第一候補：Claude Code History Viewer / CCHV を中心にする**
+
+これは名前は Claude ですが、実際には Claude Code、Codex CLI、Gemini CLI、Cursor / Cursor Agent、Aider、OpenCode、Copilot など複数のAIコーディングCLI履歴を横断検索・閲覧できる統合ビューアです。README上では 25 種類のAI coding assistants に対応し、ローカル履歴を100% offlineで読む設計とされています。([GitHub][1])
+
+対応データ場所の例も明示されています。
+
+| ツール          | 主な履歴場所・扱い                                      |
+| ------------ | ---------------------------------------------- |
+| Claude Code  | `~/.claude/projects/`                          |
+| Codex CLI    | `~/.codex/sessions/`                           |
+| Gemini CLI   | `~/.gemini/history/`                           |
+| Cursor       | `~/.cursor/`                                   |
+| Cursor Agent | `~/.cursor/projects/.../agent-transcripts/`    |
+| Aider        | project directories の chat history / edit logs |
+| OpenCode     | `~/.local/share/opencode/`                     |
+
+CCHV は「会話をあとで読む・検索する」用途ではかなり本命です。マウススクロールや画面クリアに依存せず、**各AI CLIがローカルに保存しているJSONL/SQLite/履歴ファイルを直接読む**からです。([GitHub][1])
+
+---
+
+## ただし、CCHVだけでは足りない場面
+
+あなたが言っている、
+
+> 質問が出て選択すると、その質問が消えてしまう
+> 直前に出た解説をあとで読むためにスクロールで戻るのがつらい
+
+これは2種類あります。
+
+1つ目は、**AIとの正式な会話ログ**。これは CCHV や各ツールの native history で読むのが正解です。
+
+2つ目は、**一瞬だけ画面に出た選択肢・確認ダイアログ・permission prompt・進行中表示**。これは会話ログに残らないことがあります。この場合は、`asciinema` や `script` のような**端末録画系**が必要です。
+
+つまり、理想は二重化です。
+
+```text
+AI CLI native history / CCHV
+  → あとで検索・読む本命
+
+asciinema / script / tmux logging
+  → 画面上に一瞬出たものの保険
+```
+
+---
+
+## 汎用コマンドとしては `asciinema` が一番近い
+
+`asciinema` はテキスト端末の録画・再生ツールです。端末の表示変化を `.cast` として保存し、あとで `asciinema play` で再生できます。端末ロガー用途として使っている人もいます。([asciinema forum][2])
+
+Ubuntuなら：
+
+```bash
+sudo apt install asciinema
+mkdir -p session-log/cast
+
+asciinema rec "session-log/agent-$(date '+%Y%m%d-%H%M%S').cast"
+```
+
+その中で：
+
+```bash
+claude
+codex
+gemini
+cursor-agent
+opencode
+aider
+```
+
+などを起動します。
+
+再生：
+
+```bash
+asciinema play session-log/agent-20260709-xxxxxx.cast
+```
+
+これは「ログを読む」というより「当時の端末画面を再生する」ものなので、**消えた選択肢・画面更新・TUIの動きの保険**として向いています。
+
+---
+
+## `tmux` は「作業中に戻って読む」用途に強い
+
+端末録画より実用的なのは、`tmux` の scrollback を巨大にしておくことです。`tmux` は `history-limit` でペイン履歴行数を増やせます。([Man7][3])
+
+`~/.tmux.conf` に：
+
+```tmux
+set -g history-limit 200000
+```
+
+さらに `tmux-logging` プラグインは、現在ペインの出力ログ、画面キャプチャ、ペイン履歴保存を提供しています。READMEでは「現在ペインの全出力をファイルへ保存」「現在画面のテキストキャプチャ」「ペイン作成以来の履歴保存」が主機能として説明されています。([GitHub][4])
+
+自前でやるなら：
+
+```bash
+mkdir -p session-log/tmux
+
+tmux new-session -s ai
+```
+
+tmux内で：
+
+```bash
+tmux pipe-pane -o "cat >> session-log/tmux/ai-$(date '+%Y%m%d-%H%M%S').log"
+```
+
+ただし、Claude のようなフルスクリーンTUIでは、`tmux pipe-pane` にも制御コードが混じります。**普通のCLIには強いが、TUIには限界あり**です。
+
+---
+
+## `script` は汎用だが、Claude系TUIには弱い
+
+`script` は「端末セッションを記録する」標準的なコマンドです。man pageでも terminal session の内容を記録すると説明されています。([Man7][5])
+
+```bash
+mkdir -p session-log/script
+
+script -q -f \
+  --log-out "session-log/script/agent-$(date '+%Y%m%d-%H%M%S').log" \
+  --command "codex"
+```
+
+ただし Claude Code のように画面を書き換えるTUIでは、`script` のログが読みづらくなります。Claude なら `--ax-screen-reader` を併用するのがよいです。Claude Code 公式CLIリファレンスでは、`--ax-screen-reader` は装飾ボーダーやアニメーションなしのフラットテキスト出力にし、classic renderer を強制すると説明されています。([Claude][6])
+
+```bash
+script -q -f \
+  --log-out "session-log/script/claude-$(date '+%Y%m%d-%H%M%S').log" \
+  --command "claude --ax-screen-reader"
+```
+
+---
+
+## 各AI CLIごとの「本命ログ」
+
+### Claude Code
+
+Claude は `~/.claude/projects/` を直接読むビューア系が有力です。CCHV もここを読めます。([GitHub][1])
+
+また Claude Code には非TUIの `-p / --print`、`--output-format json / stream-json` があります。公式CLIリファレンスでも `--output-format` は print mode 用で、`text`, `json`, `stream-json` を指定できると説明されています。([Claude][6])
+
+非対話で使える場面なら：
+
+```bash
+claude -p "この関数をレビューして" \
+  --output-format stream-json \
+  --verbose | tee "session-log/claude-$(date '+%Y%m%d-%H%M%S').jsonl"
+```
+
+TUIを使うなら：
+
+```bash
+claude --ax-screen-reader
+```
+
+を基本にした方がログ向きです。
+
+---
+
+### Codex CLI
+
+Codex はかなりログ運用しやすいです。公式ドキュメントでは、Codex は transcript をローカルに保存し、`codex resume`、`codex resume --all`、`codex resume --last` で再開できると説明されています。`~/.codex/sessions/` から session ID も取れます。([OpenAI Developers][7])
+
+非対話なら `codex exec` に `--json` があり、公式リファレンスでは newline-delimited JSON events を出力すると説明されています。([OpenAI Developers][8])
+
+```bash
+codex exec --json "このリポジトリの構成を説明して" \
+  | tee "session-log/codex-$(date '+%Y%m%d-%H%M%S').jsonl"
+```
+
+最終回答だけファイルに欲しい場合は：
+
+```bash
+codex exec \
+  --output-last-message "session-log/codex-last-$(date '+%Y%m%d-%H%M%S').md" \
+  "このリポジトリの構成を説明して"
+```
+
+---
+
+### Gemini CLI
+
+Gemini CLI は `/chat save`、`/chat resume`、`/chat list`、`/chat share` を持っています。公式ドキュメントでは `/chat share file.md` または `/chat share file.json` で現在の会話を書き出せると説明されています。([Google Gemini][9])
+
+Gemini内で：
+
+```text
+/chat share session-log/gemini-20260709.md
+```
+
+また `/chat save <tag>` で checkpoint を保存し、Linux/macOS では `~/.gemini/tmp/<project_hash>/` に置かれると説明されています。([Google Gemini][9])
+
+---
+
+### GitHub Copilot CLI
+
+GitHub Copilot CLI はかなり履歴機能が強いです。公式ドキュメントでは、CLI session data はローカルに保存され、デフォルトでGitHubアカウントに同期され、過去セッションの再開、`/chronicle` による履歴分析、過去のやり取りへの質問ができると説明されています。([GitHub Docs][10])
+
+Markdown export もあります。
+
+```text
+/share file session-log/copilot-session.md
+```
+
+`/export` は `/share` の alias として使えると説明されています。([GitHub Docs][10])
+
+---
+
+### OpenCode
+
+OpenCode は `opencode export [sessionID]` で session data を JSON として export できます。session ID を指定しなければ選択プロンプトが出ます。([OpenCode][11])
+
+```bash
+opencode session list
+opencode export <sessionID> > "session-log/opencode-$(date '+%Y%m%d-%H%M%S').json"
+```
+
+また非対話の `opencode run` には `--format json` があり、raw JSON events を出せます。([OpenCode][11])
+
+```bash
+opencode run --format json "このコードをレビューして" \
+  | tee "session-log/opencode-$(date '+%Y%m%d-%H%M%S').jsonl"
+```
+
+OpenCode の保存場所は macOS/Linux で `~/.local/share/opencode/`、session/message data は project-specific data として保存されると説明されています。([OpenCode][12])
+
+---
+
+### Aider
+
+Aider は最初からログ向きです。公式オプションに `--chat-history-file` があり、デフォルトは `.aider.chat.history.md` です。また `--llm-history-file` で LLM との会話ログもファイルに出せます。([aider.chat][13])
+
+```bash
+aider \
+  --chat-history-file "session-log/aider-$(date '+%Y%m%d-%H%M%S').md" \
+  --llm-history-file "session-log/aider-llm-$(date '+%Y%m%d-%H%M%S').log"
+```
+
+これは「あとでMarkdownとして読む」用途ではかなり理想的です。
+
+---
+
+### Cursor / Composer / cursor-agent
+
+Cursor Composer については、公式だけで完結するより、外部ツール併用が現実的です。
+
+`cursor-session` というGitHubツールは、Cursor IDE の Composer / Chat と cursor-agent CLI の履歴を抽出・export するCLIで、JSONL、Markdown、YAML、JSONに対応すると説明されています。([GitHub][14])
+
+```bash
+cursor-session list
+cursor-session export
+```
+
+また CCHV も Cursor / Cursor Agent の履歴を横断表示できます。([GitHub][1])
+
+---
+
+## 汎用ラッパー関数案
+
+「とりあえず何でも記録する」入口としては、私はこういう関数を作ります。
+
+```bash
+agentcast() {
+  mkdir -p session-log/cast
+  local ts
+  ts=$(date '+%Y%m%d-%H%M%S.%3N')
+
+  if [ "$#" -eq 0 ]; then
+    echo "usage: agentcast <command> [args...]"
+    echo "example: agentcast claude --ax-screen-reader"
+    echo "example: agentcast codex"
+    echo "example: agentcast gemini"
+    return 1
+  fi
+
+  local name
+  name=$(basename "$1")
+
+  asciinema rec "session-log/cast/${name}-${ts}.cast" --command "$*"
+}
+```
+
+使い方：
+
+```bash
+agentcast claude --ax-screen-reader
+agentcast codex
+agentcast gemini
+agentcast opencode
+agentcast aider
+agentcast cursor-agent
+```
+
+これは**端末画面の保険**です。
+
+一方で、読み返し本命は：
+
+```bash
+cchv-server --serve
+```
+
+または CCHV デスクトップアプリで、Claude/Codex/Gemini/Cursor/OpenCode/Aider の履歴を横断検索するのがよいと思います。
+
+---
+
+## 私のおすすめ運用
+
+一番実用的にはこれです。
+
+```text
+1. 普段は CCHV で各AI CLIの履歴を読む
+2. Claude は claude --ax-screen-reader を優先
+3. Codex / OpenCode は非対話JSONモードも活用
+4. Gemini は /chat share file.md を要所で使う
+5. 消える選択肢・TUI画面の保険として asciinema rec
+6. 作業中の視認性は tmux + history-limit 200000
+```
+
+特にあなたの用途では、**単なるログファイルより「履歴ビューア + 端末録画」の二段構え**が合っています。
+`screen` だけで全部取ろうとするより、ずっと安定するはずです。
+
+[1]: https://github.com/jhlee0409/claude-code-history-viewer "GitHub - jhlee0409/claude-code-history-viewer: desktop app to browse and analyze your Claude Code conversation history · GitHub"
+[2]: https://discourse.asciinema.org/t/using-asciinema-as-a-daily-terminal-logger/841 "Using asciinema as a daily terminal logger - Ideas - asciinema forum"
+[3]: https://man7.org/linux/man-pages/man1/tmux.1.html?utm_source=chatgpt.com "tmux(1) - Linux manual page"
+[4]: https://github.com/tmux-plugins/tmux-logging?utm_source=chatgpt.com "tmux-plugins/tmux-logging: Easy logging and screen ..."
+[5]: https://man7.org/linux/man-pages/man1/script.1.html?utm_source=chatgpt.com "script(1) - Linux manual page"
+[6]: https://code.claude.com/docs/en/cli-reference "CLI reference - Claude Code Docs"
+[7]: https://developers.openai.com/codex/cli/features?utm_source=chatgpt.com "Codex CLI features"
+[8]: https://developers.openai.com/codex/cli/reference?utm_source=chatgpt.com "Command line options – Codex CLI"
+[9]: https://google-gemini.github.io/gemini-cli/docs/cli/commands.html "CLI Commands | gemini-cli"
+[10]: https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/chronicle "Using GitHub Copilot CLI session data - GitHub Docs"
+[11]: https://opencode.ai/docs/cli/ "CLI | OpenCode"
+[12]: https://opencode.ai/docs/troubleshooting/ "Troubleshooting | OpenCode"
+[13]: https://aider.chat/docs/config/options.html?utm_source=chatgpt.com "Options reference"
+[14]: https://github.com/iksnae/cursor-session "GitHub - iksnae/cursor-session: A command-line tool to extract and export chat sessions from Cursor · GitHub"
+
+

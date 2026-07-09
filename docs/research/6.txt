@@ -1,0 +1,207 @@
+はい。その用途なら、方向性はかなり明確です。
+
+**やりたいことは `tail -f` ではなく、VS Codeを“リアルタイム追記ログビューア”として使う運用**ですね。
+これはかなり良い発想です。検索、折りたたみ、コピー、別ログとの比較ができるので、AIエージェントの作業記録には向いています。
+
+## 一番おすすめの形
+
+まずはこういうラッパー関数を作るのがよいです。
+
+```bash
+agentlog() {
+    mkdir -p session-log
+
+    if [ "$#" -eq 0 ]; then
+        echo "usage: agentlog <command> [args...]"
+        echo "example: agentlog claude --ax-screen-reader"
+        echo "example: agentlog codex"
+        echo "example: agentlog gemini"
+        return 1
+    fi
+
+    local name
+    local ts
+    local logfile
+    local cmd
+
+    name=$(basename "$1")
+    ts=$(date '+%Y%m%d-%H%M%S.%3N')
+    logfile="session-log/${name}-${ts}.log"
+
+    touch "$logfile"
+
+    # VS Codeでログを先に開く
+    code -r "$logfile" >/dev/null 2>&1 &
+
+    # 引数を安全に1つのコマンド文字列へ変換
+    cmd=$(printf '%q ' "$@")
+
+    echo "Logging to: $logfile"
+
+    script -q -f \
+        --log-out "$logfile" \
+        --command "$cmd"
+}
+```
+
+`~/.bashrc` に入れておけば、こう使えます。
+
+```bash
+agentlog codex
+agentlog gemini
+agentlog opencode
+agentlog aider
+agentlog claude --ax-screen-reader
+```
+
+`script` は端末セッションを記録する標準コマンドで、`--log-out` で出力ログ先を指定できます。`-f` はflushなので、実行中にファイルへ逐次反映されやすくなります。([linuxjm.sourceforge.io][1])
+
+---
+
+## Claudeだけは少し特別
+
+Claude Code は通常モードだとTUIが画面を直接制御するので、ログファイルが読みにくくなります。
+なので、Claudeだけはまずこれを標準にした方がよいです。
+
+```bash
+agentlog claude --ax-screen-reader
+```
+
+`--ax-screen-reader` はClaude Codeの表示をフラットテキスト寄りにするオプションなので、`script` やVS Codeログ閲覧と相性がよいです。
+
+---
+
+## VS Code側の注意点
+
+VS Codeは、外部プロセスで変更されたファイルを開いている場合、基本的にはファイル変更を検出して再読み込みします。ただし、「自動で常に末尾へ追従する」動作は標準機能だけだと弱いです。VS Codeでログ監視したい人が同じ問題を報告していて、auto-refreshはされてもauto-scrollが課題になりがちです。([Stack Overflow][2])
+
+なので、使い方は2パターンあります。
+
+### パターンA：普通にVS Codeで開く
+
+検索重視ならこれで十分です。
+
+```bash
+agentlog codex
+```
+
+VS Codeでログファイルを開いておき、必要なときに `Ctrl+F` で検索します。
+末尾追従は完全ではありませんが、検索・コピー・読み返しには一番素直です。
+
+### パターンB：VS Code拡張を使う
+
+ログ監視用なら、次の拡張が候補です。
+
+| 拡張                       | 用途                       |
+| ------------------------ | ------------------------ |
+| **Log Viewer**           | ログファイル監視。tail追従モードあり     |
+| **AutoScroll**           | 外部更新されたファイルを末尾へ自動スクロール   |
+| **Log File Highlighter** | ログの色分け。検索・読解補助           |
+| **Log Watcher**          | `tail -F` 的にOutputパネルへ流す |
+
+特に **Log Viewer** は、tail followの挙動を `auto` / `manual` で切り替えられる説明があります。([Visual Studio Marketplace][3])
+**AutoScroll** は、外部変更されたファイルを末尾へ自動スクロールする拡張として公開されています。([Visual Studio Marketplace][4])
+**Log File Highlighter** はログを読みやすく色分けする用途です。([Visual Studio Marketplace][5])
+**Log Watcher** はリアルタイムにログをOutputタブへ流す拡張です。([Visual Studio Marketplace][6])
+
+あなたの用途だと、まずは：
+
+```text
+Log Viewer
+AutoScroll
+Log File Highlighter
+```
+
+の順に試すのがよさそうです。
+
+---
+
+## さらに実用的な関数：Claude専用 / Codex専用
+
+毎回打つのが面倒なら、専用関数も作れます。
+
+```bash
+claudelog() {
+    agentlog claude --ax-screen-reader "$@"
+}
+
+codexlog() {
+    agentlog codex "$@"
+}
+
+geminilog() {
+    agentlog gemini "$@"
+}
+```
+
+使い方：
+
+```bash
+claudelog
+codexlog
+geminilog
+```
+
+Claudeだけ `--ax-screen-reader` を自動付与する形です。
+
+---
+
+## tmuxを使っている場合
+
+tmux派なら、`pipe-pane` で現在ペインの出力をファイルへ追記できます。
+
+```bash
+mkdir -p session-log
+tmux pipe-pane -o "cat >> session-log/ai-$(date '+%Y%m%d-%H%M%S').log"
+```
+
+`tmux-logging` プラグインもあり、現在ペインの出力ログ、画面キャプチャ、履歴保存ができます。([GitHub][7])
+
+ただし、ClaudeのようなTUIは制御コードが混ざるので、やはりClaudeでは：
+
+```bash
+claude --ax-screen-reader
+```
+
+を併用した方がよいです。
+
+---
+
+## 私ならこうします
+
+普段使いはこの形です。
+
+```bash
+claudelog
+codexlog
+geminilog
+```
+
+裏では：
+
+```text
+session-log/
+  claude-20260709-223012.123.log
+  codex-20260709-224501.456.log
+  gemini-20260709-225018.789.log
+```
+
+のように溜まっていく。
+
+VS Codeでは `session-log` フォルダを開いておきます。
+
+```bash
+code session-log
+```
+
+これで、左ペインから過去ログを選べるし、`Ctrl+Shift+F` で過去のClaude/Codex/Geminiログを横断検索できます。
+この運用なら、`tail -f` のスクロールバー問題を避けつつ、あとから検索できる「AI作業記録」になります。
+
+[1]: https://linuxjm.sourceforge.io/html/util-linux/man1/script.1.html?utm_source=chatgpt.com "Man page of SCRIPT"
+[2]: https://stackoverflow.com/questions/46600679/automatic-scoll-down-on-document-refresh-vs-code?utm_source=chatgpt.com "Automatic scoll down on document refresh (VS Code)"
+[3]: https://marketplace.visualstudio.com/items?itemName=berublan.vscode-log-viewer&utm_source=chatgpt.com "vscode-log-viewer README"
+[4]: https://marketplace.visualstudio.com/items?itemName=pejmannikram.vscode-auto-scroll&utm_source=chatgpt.com "AutoScroll"
+[5]: https://marketplace.visualstudio.com/items?itemName=emilast.LogFileHighlighter&utm_source=chatgpt.com "Log File Highlighter"
+[6]: https://marketplace.visualstudio.com/items?itemName=automattic.logwatcher&utm_source=chatgpt.com "Log Watcher"
+[7]: https://github.com/tmux-plugins/tmux-logging?utm_source=chatgpt.com "tmux-plugins/tmux-logging: Easy logging and screen ..."
+

@@ -1,0 +1,242 @@
+難しいです。
+ただし、**完全に無理ではなく、「どのレベルのログで妥協するか」**になります。
+
+## 結論
+
+Claudeを **`--ax-screen-reader` なし**で動かす場合、`asciinema` の `.cast` からリアルタイムに「読みやすい追記ログ」を作るのはかなり難しいです。
+
+理由は単純で、Claude通常TUIの出力は、
+
+```text
+文章を1行ずつ出している
+```
+
+のではなく、
+
+```text
+画面全体を描き換える
+カーソルを移動する
+前の文字を上書きする
+画面をクリアする
+alternate screenを使う
+マウスイベントを扱う
+```
+
+というタイプだからです。
+
+`.cast` 自体はリアルタイム処理しやすい形式です。asciicast v2/v3 は newline-delimited JSON で、最初の1行がヘッダ、その後がイベントストリームです。v2については公式ドキュメントでも「incremental, real-time writing to disk」が可能と説明されています。([docs.asciinema.org][1]) v3も同じくJSON Lines形式で、出力イベント、入力イベント、リサイズ、終了イベントなどを持ちます。([docs.asciinema.org][2])
+
+なので、**生データを読むことはできます**。
+問題は、それを「あとで読む文章ログ」に変換する部分です。
+
+---
+
+## 単純抽出ならできる
+
+`.cast` から出力イベントだけ抜くなら、こうです。
+
+```bash
+tail -n +2 -F session.cast \
+  | jq -jr 'select(type=="array" and .[1]=="o") | .[2]' \
+  >> session.raw.log
+```
+
+これは `.cast` の2行目以降から、`"o"`、つまり terminal output だけを抜き出します。
+
+ただし、Claude通常TUIだとこのログには大量の制御文字が混ざります。
+
+```text
+ESC [ 2 J
+ESC [ H
+ESC [?1049h
+ESC [?1000h
+ESC [38;5;...
+```
+
+のようなものです。VS Codeで開くと検索以前に読みにくいはずです。
+
+---
+
+## ANSI制御文字を消すだけならできる
+
+一応こういうフィルタは書けます。
+
+```bash
+tail -n +2 -F session.cast \
+  | jq -jr 'select(type=="array" and .[1]=="o") | .[2]' \
+  | perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g; s/\e\][^\a]*(\a|\e\\)//g' \
+  >> session.text.log
+```
+
+でも、これは**制御文字を捨てているだけ**です。
+
+Claudeが、
+
+```text
+質問Aを表示
+↓
+選択後に質問Aを消す
+↓
+回答Bに置き換える
+```
+
+という画面操作をした場合、制御文字を消すだけでは「質問Aがどこに表示されていたか」「何が上書きされたか」は正しく復元できません。
+
+つまり、**画面状態を解釈する端末エミュレータが必要**になります。
+
+---
+
+## 端末エミュレータを噛ませれば近づける
+
+理屈としては、
+
+```text
+asciinema .cast
+  ↓
+JSONLをtail
+  ↓
+outputイベントを取り出す
+  ↓
+VT100/xterm互換パーサに流す
+  ↓
+現在の画面バッファを復元
+  ↓
+一定間隔で text / markdown に保存
+```
+
+という構成にできます。
+
+Pythonなら `pyte` のような端末エミュレータライブラリを使う方向です。
+
+イメージはこうです。
+
+```bash
+pip install pyte
+```
+
+```python
+#!/usr/bin/env python3
+import json
+import time
+from pathlib import Path
+import pyte
+
+cast_file = Path("session.cast")
+out_file = Path("session-screen.txt")
+
+screen = pyte.Screen(160, 60)
+stream = pyte.Stream(screen)
+
+with cast_file.open("r", encoding="utf-8", errors="replace") as f:
+    # header skip
+    f.readline()
+
+    while True:
+        line = f.readline()
+        if not line:
+            time.sleep(0.2)
+            continue
+
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(event, list) or len(event) < 3:
+            continue
+
+        _delay, kind, data = event
+
+        if kind == "o":
+            stream.feed(data)
+
+            # 現在画面のスナップショットを書き出す
+            text = "\n".join(screen.display)
+            out_file.write_text(text.rstrip() + "\n", encoding="utf-8")
+```
+
+ただし、これは**追記ログではなく、現在画面のスナップショット更新**です。
+VS Codeで開くファイルとしては便利ですが、「過去に出た質問を全部残す」用途にはまだ弱いです。
+
+過去も残すなら、一定間隔ごとに区切って追記します。
+
+```python
+out_file.open("a", encoding="utf-8").write(
+    "\n\n--- screen snapshot ---\n\n" + text.rstrip() + "\n"
+)
+```
+
+ただ、これをやると同じ画面が何度も記録され、ログがかなり肥大化します。
+
+---
+
+## asciinema 3系なら `.txt` 直接記録もある
+
+asciinema 3系のman pageでは、出力形式として `raw` と `txt` があり、`.txt` を指定すると plain-text log として記録できると説明されています。`raw` は制御シーケンス込み、`txt` は色や制御シーケンスなしの人間可読テキストです。([mankier.com][3])
+
+つまり、バージョンが対応していれば：
+
+```bash
+asciinema rec session-log/claude.txt --command "claude"
+```
+
+または明示的に：
+
+```bash
+asciinema rec --output-format txt session-log/claude.txt --command "claude"
+```
+
+が試せます。
+
+ただし、これも Claude通常TUIでは期待どおりにならない可能性が高いです。
+`txt` 化は「制御コードを除去したテキスト」に近いので、**Claudeが画面上で消した質問・選択肢を履歴としてきれいに保存する保証はありません**。
+
+---
+
+## 現実的なおすすめ
+
+あなたの用途なら、私はこう分けます。
+
+```text
+1. Claude通常TUIの完全保存
+   → asciinema .cast を保存
+   → あとで asciinema play で再生
+
+2. VS Codeでリアルタイム検索したいログ
+   → claude --ax-screen-reader
+   → script / asciinema txt / tee 系で追記ログ
+
+3. Claude通常TUIをどうしてもVS Codeで見る
+   → .cast をtailして pyte で画面スナップショット化
+   → ただし追記型ログとしては不完全
+```
+
+つまり、**Claudeを `--ax-screen-reader` なしで使うなら、asciinemaは「動画的な再生ログ」と割り切る方がよい**です。
+VS Codeで検索したいテキストログを主目的にするなら、Claudeだけは `--ax-screen-reader` を付けるのがかなり重要です。
+
+## 私ならこう運用します
+
+Claude通常TUIを使いたいとき：
+
+```bash
+mkdir -p session-log
+asciinema rec "session-log/claude-$(date '+%Y%m%d-%H%M%S').cast" \
+  --command "claude"
+```
+
+検索可能ログを優先するとき：
+
+```bash
+mkdir -p session-log
+asciinema rec "session-log/claude-$(date '+%Y%m%d-%H%M%S').txt" \
+  --command "claude --ax-screen-reader"
+```
+
+Codex / Gemini / Aider / OpenCode のように比較的ログに素直なCLIは、`.txt` 直接記録か `script --log-out` でよいと思います。
+
+Claude通常TUIだけは別格で、**「追記テキストログ化」より「画面再生保存」向き**です。
+
+[1]: https://docs.asciinema.org/manual/asciicast/v2/ "asciicast v2 - asciinema docs"
+[2]: https://docs.asciinema.org/manual/asciicast/v3/ "asciicast v3 - asciinema docs"
+[3]: https://www.mankier.com/1/asciinema-record "asciinema-record: Record a terminal session | Man Page | Commands | asciinema | ManKier"
+

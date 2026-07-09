@@ -1,0 +1,19 @@
+{
+  "name": "record",
+  "version": "0.1.0",
+  "description": "CLI AI ハーネス（claude 等）のセッションを asciicast v2 で lossless 記録しつつ、リアルタイムで可読テキストログも同時出力するコマンドラインレコーダ",
+  "type": "module",
+  "bin": {
+    "record": "./bin/record.mjs"
+  },
+  "author": "tosihide",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tsdhgm/record.git"
+  },
+  "dependencies": {
+    "@xterm/headless": "^5.5.0",
+    "node-pty": "^1.0.0"
+  }
+}

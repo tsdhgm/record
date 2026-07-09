@@ -1,0 +1,326 @@
+発想はかなり良いです。
+ただし、**「tmuxの画面を定期的に読んで、差分を追記ログにする」方式は、Claude通常TUI相手だと少し筋が悪い**です。
+
+一方で、**tmuxをログ中継レイヤーにする**のは筋が良いです。
+
+## まず整理：tmux自体が仮想端末の管理者
+
+tmux の pane は、それぞれが独立した擬似端末、つまり pty です。tmux の man page でも、session は pseudo terminals の集合で、各 pane は separate pseudo terminal と説明されています。([Man7][1])
+
+なので構造としてはこうです。
+
+```text
+実端末 / GNOME Terminal / VS Code Terminal
+  ↓
+tmux client
+  ↓
+tmux server
+  ↓
+tmux pane = pty
+  ↓
+claude / codex / gemini
+```
+
+このため、別端末から同じ tmux session / pane を覗いたり、`capture-pane` したり、`pipe-pane` したりできます。
+
+## あなたの案：capture-pane差分追記方式
+
+イメージとしてはこうですよね。
+
+```text
+端末A:
+  tmux 内で claude 実行
+
+端末B:
+  tmux capture-pane で端末Aのpaneを定期取得
+  前回との差分を比較
+  新しい行だけ log に追記
+  VS Codeでそのlogを開く
+```
+
+これは作れます。
+ただし、Claude通常TUIでは弱点があります。
+
+## 弱点1：Claude通常TUIは「行ログ」ではなく「画面状態」
+
+Claude通常TUIは、たぶんこういう動作をしています。
+
+```text
+1. 画面全体を描画
+2. カーソルを戻す
+3. 一部を上書き
+4. 選択肢を消す
+5. 同じ場所に別の文字を描く
+6. alternate screenを使う
+```
+
+この場合、`改行コードが来たら追記` という考え方が崩れます。
+なぜなら、TUIは必ずしも「1行ずつ標準出力に追加」していないからです。
+
+たとえば Claude が画面中央に質問を出して、その後同じ場所を空白で上書きした場合、`capture-pane` で見えるのは**現在の画面状態**です。過去に一瞬出た質問は、すでに消えている可能性があります。
+
+## 弱点2：alternate screen の扱いが厄介
+
+tmux の `capture-pane` には `-a` があり、alternate screen をキャプチャできます。ただし man page では、`-a` を使うと alternate screen が使われ、history はアクセスできないと説明されています。([Man7][1])
+
+ここが重要です。
+
+Claude通常TUIが alternate screen 上で動いている場合、
+
+```bash
+tmux capture-pane -a -p
+```
+
+で**現在のClaude画面**は取れるかもしれません。
+
+しかし、それはあくまで現在画面です。
+「過去に表示されたが消えた質問」「選択後に消えた候補」「スクロール内部にあった説明」を、行単位の履歴として完全復元するのは難しいです。
+
+## 弱点3：差分比較が意外と壊れやすい
+
+画面差分方式は、こういうケースに弱いです。
+
+```text
+前回:
+  1: 質問: 実行しますか？
+  2: > はい
+  3:   いいえ
+
+今回:
+  1: 実行中...
+  2:
+  3:
+```
+
+単純な行差分だと、
+
+```text
+質問: 実行しますか？
+> はい
+いいえ
+```
+
+を「過去ログ」として残すべきなのか、
+それとも「画面から消えたので削除」すべきなのか、判断できません。
+
+ログとして残したいなら残すべきですが、画面スナップショットの差分だけでは意味づけが難しいです。
+
+## もっと筋が良いのは `pipe-pane`
+
+tmux には、pane に送られた出力を外部コマンドへ流す `pipe-pane` があります。tmux wikiでも、pane の新しい変更をコマンドへ pipe でき、pane log の作成に使えると説明されています。([GitHub][2])
+
+man page でも、`pipe-pane` は target pane のプログラム出力を shell command に pipe できると説明されています。([Man7][1])
+
+なので、まずはこちらです。
+
+```bash
+mkdir -p session-log
+
+tmux new-session -s ai
+```
+
+tmux 内で Claude を起動：
+
+```bash
+claude
+```
+
+別端末から pane を確認：
+
+```bash
+tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_id} #{pane_current_command}'
+```
+
+たとえば対象が `ai:0.0` なら：
+
+```bash
+tmux pipe-pane -t ai:0.0 -o "cat >> session-log/claude.raw.log"
+```
+
+これで、その pane に流れた出力が `claude.raw.log` に追記されます。
+
+止めるとき：
+
+```bash
+tmux pipe-pane -t ai:0.0
+```
+
+これは **capture-pane polling より筋が良い**です。
+理由は、画面を後から読みに行くのではなく、tmuxが受け取った出力ストリームをその場で横取りするからです。
+
+ただし、Claude通常TUIではここにも制御コードが混じります。
+つまり、
+
+```text
+pipe-pane = 出力ストリーム保存
+capture-pane = 現在画面保存
+```
+
+です。
+
+Claude通常TUIをきれいな文章ログにするには、どちらもまだ不十分です。
+
+## さらに作り込むなら tmux control mode
+
+本格的に作るなら、`capture-pane` をポーリングするより、tmux の **control mode** を使う方が設計としては上です。
+
+tmux control mode は、tmux とテキストプロトコルで通信するためのモードです。tmux wikiでは、control mode は tmux client が tmux と simple text-only protocol で話すための特別なモードで、パースしやすいと説明されています。([GitHub][3])
+
+control mode では pane の出力が `%output` 通知として流れます。tmux wikiにも、attached session の各 pane の出力が `%output` notification として送られると説明されています。([GitHub][3])
+
+tmux man pageでも、control mode の `%output pane-id value` は window pane が出力を生成した通知だと説明されています。([Man7][1])
+
+つまり構造はこうです。
+
+```text
+tmux control mode client
+  ↓
+%output %1 ...
+%output %1 ...
+%layout-change ...
+%pane-mode-changed ...
+```
+
+これを自作プログラムで受けて、
+
+```text
+raw event log
+screen snapshot
+plain text extract
+```
+
+に分けて保存するのが、かなり良い作りです。
+
+## ただし、最終的には端末エミュレータが必要
+
+Claude通常TUIをまともに扱うなら、最終的にはこうなります。
+
+```text
+tmux %output / pipe-pane / asciinema cast
+  ↓
+ANSI / VT100 / xterm escape sequence parser
+  ↓
+仮想画面バッファ
+  ↓
+現在画面 snapshot.txt
+  ↓
+重要そうな差分だけ append log
+```
+
+つまり、**自分で小さな端末エミュレータを書く／既存ライブラリを使う**ことになります。
+
+この設計なら筋は悪くありません。
+でも、「改行が来たら差分追記」だけだと弱いです。
+
+## 私の評価
+
+あなたの案をそのまま評価すると、こうです。
+
+```text
+tmuxの別端末からpaneを読む
+  → 筋が良い
+
+capture-paneを定期実行する
+  → 試作としては良い
+
+改行コードごとに差分追記する
+  → Claude通常TUI相手には筋が悪い
+
+pipe-paneで出力を受ける
+  → capture-pane pollingより筋が良い
+
+control modeで%outputを読む
+  → 自作ツールとしては一番筋が良い
+
+最終的にVT100/xtermパーサで画面復元
+  → Claude通常TUIを扱うなら必要
+```
+
+## 現実的な試作案
+
+まずはこれで十分だと思います。
+
+### 1. tmux paneの出力をraw保存
+
+```bash
+tmux pipe-pane -t ai:0.0 -o "cat >> session-log/claude.raw.log"
+```
+
+### 2. 同時に現在画面を定期snapshot
+
+```bash
+while true; do
+  {
+    echo "===== $(date '+%Y-%m-%d %H:%M:%S.%3N') ====="
+    tmux capture-pane -a -p -J -t ai:0.0
+    echo
+  } > session-log/claude.current-screen.txt
+
+  sleep 1
+done
+```
+
+これは追記ではなく、**現在画面ファイルを上書き**します。
+VS Codeで開いておけば、今のClaude画面を別ビューとして読めます。
+
+### 3. 必要ならsnapshot履歴も残す
+
+```bash
+while true; do
+  {
+    echo
+    echo "===== $(date '+%Y-%m-%d %H:%M:%S.%3N') ====="
+    tmux capture-pane -a -p -J -t ai:0.0
+  } >> session-log/claude.snapshots.log
+
+  sleep 5
+done
+```
+
+これはログが肥大化しますが、「消えた質問」を拾える可能性は上がります。
+
+## でも一番よい実用構成はこれ
+
+Claude通常TUIを諦めないなら：
+
+```text
+claude通常TUI
+  → asciinema / tmux pipe-pane でraw保存
+  → 必要時に再生・解析
+
+VS Codeで検索する読み返しログ
+  → claude --ax-screen-reader
+  → script / pipe-pane / tee で追記保存
+
+Codex/Gemini/Aider/OpenCode
+  → native history + script/pipe-pane
+```
+
+つまり、**通常TUIを完全な追記テキストログに変換しようとするより、通常TUIは録画・snapshot、検索ログはscreen-reader/print/json系に分ける**のが良いです。
+
+## 最終コメント
+
+ソフトの作りとしては、
+
+**「tmuxを観測対象にする」発想は良い**です。
+ただし、**「capture-paneで行差分を作る」部分は、Claude通常TUI相手には壊れやすい**です。
+
+作るなら、最初からこの3ファイル方式にした方が実用的です。
+
+```text
+agent.raw.log
+  端末出力をそのまま保存。後で解析・再生用。
+
+agent.current-screen.txt
+  現在画面のスナップショット。VS Codeで常時表示用。
+
+agent.events.md
+  自分で抽出できた、人間が読むための要約・差分ログ。
+```
+
+この設計なら、かなり現実的です。
+
+[1]: https://man7.org/linux/man-pages/man1/tmux.1.html "tmux(1) - Linux manual page"
+[2]: https://github.com/tmux/tmux/wiki/Advanced-Use "Advanced Use · tmux/tmux Wiki · GitHub"
+[3]: https://github.com/tmux/tmux/wiki/Control-Mode "Control Mode · tmux/tmux Wiki · GitHub"
+

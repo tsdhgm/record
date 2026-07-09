@@ -1,0 +1,129 @@
+結論としては、**Claude Code は端末そのものを録画するより、Claude 側の会話ログを直接読む／export する方が安定**です。`screen` や `script` は「端末に出た文字」を取る道具なので、Claude のようなフルスクリーンTUI・alternate screen・mouse reporting 型のUIとは相性が悪いです。
+
+Claude については、まずこの順で試すのがよいです。
+
+## 1. Claude Code は `/export` が第一候補
+
+Claude Code には公式に `/export [filename]` があり、現在の会話をプレーンテキストとして保存できます。ファイル名を付けると直接そのファイルに書き込み、付けないとコピー／保存ダイアログになります。([Claude][1])
+
+Claude 内で：
+
+```text
+/export session-log/claude-20260709-001.md
+```
+
+これが一番「あとで読み返すログ」に向いています。端末の制御コード、画面クリア、スクロール、マウスキャプチャの影響を受けにくいからです。
+
+## 2. Claude のTUIを避けて `script` で取るなら `--ax-screen-reader`
+
+Claude Code には `--ax-screen-reader` というフラグがあり、装飾的なボーダーやアニメーションなしのフラットテキスト出力にして、クラシックレンダラーを強制します。これは今回の用途にかなり重要です。([Claude][2])
+
+Ubuntu なら、まずこれを試す価値があります。
+
+```bash
+mkdir -p session-log
+
+script -q -f \
+  --log-out "session-log/claude-$(date '+%Y%m%d-%H%M%S.%3N').log" \
+  --command "claude --ax-screen-reader"
+```
+
+`script` は端末セッションを記録する標準的なコマンドで、`--command` で指定したコマンドを擬似端末上で動かせます。`--flush` はリアルタイムに近く書き出すためのオプションです。([Ubuntu Manpages][3])
+
+ただし、`script` のman pageにも「vi のような画面を直接操作する対話コマンドは typescript にゴミが出る」と注意されています。Claude の通常TUIもこの系統なので、**通常の `claude` ではなく `claude --ax-screen-reader` と組み合わせる**のがポイントです。([Ubuntu Manpages][3])
+
+## 3. Codex は `~/.codex/sessions/` が第一候補
+
+Codex CLI は公式ドキュメントで、会話 transcript をローカルに保存し、`codex resume` で過去セッションを再開できると説明されています。`codex resume --all` や `codex resume --last` もあります。([OpenAI Developers][4])
+
+Codex の場合は、端末ロガーよりまず：
+
+```bash
+codex resume
+codex resume --all
+codex resume --last
+```
+
+を使うのが自然です。
+
+外部記事ベースですが、Codex CLI のログは `~/.codex/sessions/YYYY/MM/DD/` 配下の JSONL として扱うツールも出ています。Claude は `~/.claude/projects/`、Codex は `~/.codex/sessions/` を読む `claude-logs` / `codex-logs` というシェルスクリプトも紹介されています。([Zenn][5])
+
+## 4. GitHub系・代替コマンド一覧
+
+用途別に整理するとこうです。
+
+| 道具                      | 用途                           | Claude/Codex向きか                     |
+| ----------------------- | ---------------------------- | ----------------------------------- |
+| `script`                | 端末I/Oの標準的な記録                 | Claudeは `--ax-screen-reader` 併用なら有力 |
+| `asciinema`             | 端末セッションを `.cast` として録画・再生    | 読み返しより「再生」向き                        |
+| `ttyrec` / `ovh-ttyrec` | 古典的なTTY録画・再生                 | TUI再生向き、テキストログ閲覧には弱い                |
+| `tmux pipe-pane`        | tmuxペイン出力をファイルへ流す            | 通常CLIには便利、Claude TUIは微妙             |
+| `tmux capture-pane`     | tmuxの表示／スクロールバックを保存          | その時点の画面保存向き                         |
+| `screen -L`             | screenのログ                    | 今回のClaudeでは相性悪い可能性大                 |
+| `tlog`                  | 端末I/Oの監査ログ                   | 本格運用・監査向き、個人用途にはやや重い                |
+| `rewindtty`             | JSON形式で端末を録画・再生              | 実験価値あり                              |
+| `claude-history`        | Claude Codeのローカル履歴検索・表示      | Claudeにはかなり有力                       |
+| `Codex History Viewer`  | VS CodeでCodex/Claude履歴を検索・表示 | GUIで読み返すなら有力                        |
+
+`awesome-terminal-recorder` というGitHubリポジトリには、`asciinema`, `vhs`, `terminalizer`, `termtosvg`, `ttygif`, `rewindtty`, `script` などの端末録画ツールがまとまっています。([GitHub][6])
+
+`claude-history` は Claude Code のローカル会話履歴を検索・表示・export するCLIで、Claude のローカル project history を自動検出してTUIで閲覧できると説明されています。([GitHub][7])
+
+VS Code を使うなら、`Codex History Viewer` という拡張もあり、Codex CLI / Claude Code のローカルセッション履歴を検索・タグ付け・import/export・チャット風表示できると説明されています。最新版は 2026年7月2日時点で 2.7.0 と表示されています。([Visual Studio Marketplace][8])
+
+## なぜ `screen` でうまく取れないのか
+
+見立てとしては、かなり合っています。Claude Code の最近のTUIは、普通の行出力ではなく、**fullscreen TUI + alternate screen + mouse reporting** に近い動きをしているようです。GitHub issue でも、Claude Code の fullscreen TUI が mouse-reporting と alternate-screen mode に切り替えるため、GNOME Terminal の通常スクロールや右クリックが捕捉される、という報告があります。([GitHub][9])
+
+alternate screen は、通常の端末バッファとは別の画面バッファで、終了時にその内容が消える／元の画面に戻る仕組みです。Ratatui の解説でも、alternate screen はメイン画面と別バッファで、終了時に内容がクリアされると説明されています。([Ratatui][10])
+
+また、マウスホイールについても、端末ではアプリが alternate screen や mouse reporting を有効にすると、ホイールイベントをアプリ側に渡せます。Julia Evans の解説では、scroll wheel は alternate screen では上下キー相当になったり、mouse reporting ではボタン4/5のマウスイベントとしてプログラムへ送られると説明されています。([Julia Evans][11])
+
+つまり、Claude が「自前でスクロールしている」ように見えるのは自然です。
+
+## 私ならこう運用します
+
+Claude 用：
+
+```bash
+claude-log() {
+  mkdir -p session-log
+  local ts
+  ts=$(date '+%Y%m%d-%H%M%S.%3N')
+  script -q -f \
+    --log-out "session-log/claude-${ts}.log" \
+    --command "claude --ax-screen-reader"
+}
+```
+
+Codex 用：
+
+```bash
+codex-log() {
+  mkdir -p session-log
+  local ts
+  ts=$(date '+%Y%m%d-%H%M%S.%3N')
+  script -q -f \
+    --log-out "session-log/codex-${ts}.log" \
+    --command "codex"
+}
+```
+
+ただし最終的には、**Claude は `/export` または `claude-history`、Codex は `~/.codex/sessions/` 系ビューア**を主にし、`script` は保険として使うのが一番安全だと思います。
+
+注意点として、`script --log-io` を使うと入力も記録できる反面、パスワードなどエコーされない入力まで保存される可能性があります。man page でもセキュリティ上の注意が明記されています。通常はまず `--log-out` だけで十分です。([Ubuntu Manpages][3])
+
+[1]: https://code.claude.com/docs/en/commands "Commands - Claude Code Docs"
+[2]: https://code.claude.com/docs/ja/cli-reference "CLI リファレンス - Claude Code Docs"
+[3]: https://manpages.ubuntu.com/manpages/noble/man1/script.1.html "Ubuntu Manpage: script - make typescript of terminal session"
+[4]: https://developers.openai.com/codex/cli/features "Features – Codex CLI | OpenAI Developers"
+[5]: https://zenn.dev/ao_4_ma/articles/66aa603b8aaa27 "AI CLIのセッションログを快適に閲覧するツールを作った（Claude Code / Codex CLI対応）"
+[6]: https://github.com/orangekame3/awesome-terminal-recorder "GitHub - orangekame3/awesome-terminal-recorder:  Curated list of outstanding terminal recording tools to enhance your CLI demonstrations and tutorials. · GitHub"
+[7]: https://github.com/raine/claude-history "GitHub - raine/claude-history: Fuzzy-search Claude Code conversation history · GitHub"
+[8]: https://marketplace.visualstudio.com/items?itemName=hiztam.codex-history-viewer "
+        Codex History Viewer - Visual Studio Marketplace
+    "
+[9]: https://github.com/anthropics/claude-code/issues/70251?utm_source=chatgpt.com "native scroll + right-click both captured inside Claude Code ..."
+[10]: https://ratatui.rs/concepts/backends/alternate-screen/?utm_source=chatgpt.com "Alternate Screen"
+[11]: https://jvns.ca/til/two-ways-the-mouse-wheel-works-in-the-terminal/?utm_source=chatgpt.com "Two ways the mouse wheel works in the terminal"
+
