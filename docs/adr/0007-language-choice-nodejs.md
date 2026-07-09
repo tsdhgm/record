@@ -57,6 +57,8 @@ JavaScript (Node.js) を実装言語として **追認**する。書き直しは
 
 - node-pty がネイティブ依存（記録モードのみ。convert 系は pure JS で全 OS 可搬）。
 - 単一バイナリ配布はできない（Node ランタイムと node_modules が必要）。
+  配布方式の選択肢（npm bin / shebang、Bun 等でのランタイム同梱バイナリ化）は
+  [../notes/nodejs-cli-packaging.md](../notes/nodejs-cli-packaging.md) にまとめた。
 - **教訓として**: 言語のような基盤選定は、参照実装からの惰性で決まりがちである。
   今回は結果的に技術的必然と一致していたが、本来は着手時に一度立ち止まって
   本 ADR のような比較を行い、発注者に選択肢を示すべきだった。
